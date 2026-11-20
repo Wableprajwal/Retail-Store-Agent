@@ -119,9 +119,13 @@ python main.py                                                # interactive CLI 
 ## Demo script (2 minutes, for the call)
 
 1. "I built a retail agent a few months ago. I wanted to know if it was *reliable*, not just whether it works once."
-2. `python -m evals.runner --guard off --k 5`: pass@1 looks okay, pass^5 collapses, double refunds and duplicate POs.
+2. Show the "before" table in RELIABILITY.md (original code: pass@1 0.40-0.60, pass^5 0.00 everywhere, 45 duplicate
+   writes). Then run `python3 -m evals.runner --guard off --k 5` live: DB fixes alone get to 0.44; duplicate orders,
+   promos, partial returns and PO receipts remain, because the DB can't tell a retry from a real repeat.
 3. Explain the three duplicate kinds (table above). The intent key is the non-obvious one.
-4. `python -m evals.runner --guard on --k 5`: pass^5 = 1.00, 0 duplicates, N replayed; gate passes.
+4. `python3 -m evals.runner --guard on --k 5`: pass^5 = 1.00, 0 duplicates, 22 replayed; gate passes.
+   Be upfront: scripted retries reuse identical args, so this is an upper bound; seed 42 at k=20 shows a liveness
+   failure (agent gave up after 3 malformed responses) that the guard correctly doesn't paper over.
 5. At AWS scale: ledger → DynamoDB conditional put + TTL (same pattern as Powertools for AWS Lambda idempotency);
    in-progress lease for crash-between-claim-and-complete; evals on sampled prod traces; fault injection in canaries.
 6. Ask him: how does his team scope "same intent"? Per turn, per session, per time window?
@@ -131,14 +135,33 @@ python main.py                                                # interactive CLI 
 - [x] Branch `reliability-guard` created; baseline 16/16 tests pass.
 - [x] CLAUDE.md handoff written; draft PR opened.
 - [x] Eval harness (faults, scripted agent, scenarios, runner, `run_turn` refactor): guard off shows bugs.
-      Original code: pass^5 avg 0.00, 59 duplicate writes. (commit c1cbafd)
-- [x] DB-level fixes for bugs 1-3. Guard off: pass^5 avg 0.50, 23 duplicate writes. (commit 6612fcb)
+      Original code: pass^5 avg 0.00, 59 duplicate writes at the time (commit c1cbafd).
+- [x] DB-level fixes for bugs 1-3. Guard off: pass^5 avg 0.50, 23 duplicate writes at the time. (commit 6612fcb)
       Note: these fixes apply with the guard off too, so `--guard off` on HEAD shows the "DB fixes only" picture.
-      To reproduce the original numbers, run the harness at commit c1cbafd.
+      To reproduce original-code numbers with the current harness: copy the repo, restore agent/tools.py and
+      agent/db.py from aba6d92, run `--guard off` there (see RELIABILITY.md).
 - [x] Guard (ledger, intent key, invariants, guarded dispatch) + `tests/test_guard.py` (11 tests).
       Guard on: pass^5 1.00, 0 duplicate writes; also holds at k=20 for seeds 1,2,3,42,99. (commit da9098a)
 - [x] CI gate (`evals/thresholds.json` + `.github/workflows/eval.yml`).
 - Shell note: the dev machine has `python3`, not `python`.
-- [ ] RELIABILITY.md with real before/after numbers; README section.
-- [ ] Opus code review of the full diff; fixes applied.
+- [x] RELIABILITY.md with real before/after numbers; README section. (commit eb627de)
+- [x] Opus code review of the full diff; fixes applied:
+      - must-fix: transport key is now `turn_id:call_id`, and a reused key with different args is rejected
+        (Gemini reuses the function name as call id, which caused stale replays)
+      - intent key lowercases only case-insensitive fields; create_return normalizes `condition`
+      - fault RNG seeded per (seed, scenario, run) via crc32 (it was correlated across scenarios)
+      - new scenario `receive_partial_po` (receive_purchase_order had no coverage)
+      - runner loads .env for `--agent claude`; run_turn logs when max_steps is hit
+      - 3 new guard tests (14 total)
+      Current numbers (seed 7, k=5, 9 scenarios): original 0.00 / 45 dups; DB fixes 0.44 / 25; guard 1.00 / 0.
+      k=20: passes seeds 1,2,3,99; seed 42 = 0.89 from one liveness failure (documented, intentionally not tuned away).
 - [ ] Live Claude run (optional; no API key on the dev machine at time of writing).
+      `pip install anthropic`, put ANTHROPIC_API_KEY in .env, `python3 -m evals.runner --guard on --k 3 --agent claude`.
+      Expect it to be noisier than scripted; that's the honest number to quote.
+
+## Ideas for next steps (not started)
+- Retry budget + explicit "action did not complete" message in the agent (fixes the seed-42 liveness case).
+- Model-retry robustness: canonicalize args against the tool schema (types, defaults) before hashing the intent key.
+- In-progress lease/expiry in the ledger; ledger TTL cleanup.
+- Per-tool intent scope policy (turn / session / time window).
+- DynamoDB-backed Ledger behind the same interface.

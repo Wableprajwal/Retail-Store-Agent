@@ -77,6 +77,40 @@ def test_same_args_different_turn_executes():
     assert _count("SELECT COUNT(*) FROM returns WHERE order_id='O-1008'") == 2
 
 
+def test_reused_call_id_different_args_rejected():
+    # Gemini uses the function name as the call id, so ids repeat within a turn
+    fresh_db()
+    d = make_dispatch(True)
+    ctx = {"call_id": "create_order", "turn_id": "t1"}
+    a = d("create_order", {"items": [{"sku": "MUG", "quantity": 1}], "payment_method": "cash"}, ctx)
+    b = d("create_order", {"items": [{"sku": "MUG", "quantity": 3}], "payment_method": "card"}, ctx)
+    assert "error" not in a, a
+    assert "reused with different arguments" in b.get("error", ""), b
+    assert "_replayed" not in b
+
+
+def test_reused_call_id_across_turns_executes():
+    # Same provider id in a later turn is a new request, never a stale replay
+    fresh_db()
+    d = make_dispatch(True)
+    order = {"items": [{"sku": "MUG", "quantity": 1}], "payment_method": "cash"}
+    a = d("create_order", dict(order), {"call_id": "create_order", "turn_id": "t1"})
+    b = d("create_order", dict(order), {"call_id": "create_order", "turn_id": "t2"})
+    assert "_replayed" not in b and b["order_id"] != a["order_id"], (a, b)
+
+
+def test_case_only_matters_for_case_insensitive_fields():
+    # 'Good' and 'good' are the same return; a different order id is not
+    fresh_db()
+    d = make_dispatch(True)
+    a = d("create_return", dict(RET, condition="Good"), {"call_id": "c1", "turn_id": "t1"})
+    assert a["inventory_restored"] is True, a
+    b = d("create_return", dict(RET, condition="good"), {"call_id": "c2", "turn_id": "t1"})
+    assert b.get("_replayed") is True, b
+    c = d("create_return", dict(RET, order_id="o-1008"), {"call_id": "c3", "turn_id": "t1"})
+    assert "_replayed" not in c, c
+
+
 def test_failed_write_releases_claim():
     fresh_db()
     d = make_dispatch(True)

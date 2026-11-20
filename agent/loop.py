@@ -61,6 +61,8 @@ def run_turn(client, history, user_text, dispatch_fn, turn_id, max_steps=12, log
         else:
             log("[No further response from model]")
             break
+    else:
+        log(f"[Stopped after {max_steps} steps without a final answer]")
 
     return {"text": text, "tool_calls": calls}
 

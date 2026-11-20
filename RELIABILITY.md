@@ -26,49 +26,52 @@ The intent key is the non-obvious one. A model retry has a new call id, so the c
 
 ## 4. Results
 
-All numbers are real runner output: 8 scenarios, k=5, faults injected (lost acks, duplicate delivery, malformed responses).
+All numbers are real runner output: 9 scenarios, k=5, seed 7, faults injected (lost acks, duplicate delivery, malformed responses). Each (seed, scenario, run) gets its own fault stream.
 
-Original code, guard off. `violations` is n/a because the guard module did not exist yet:
+Original code, guard off. `violations` is n/a because the guard module did not exist yet. Note pass@1 of 0.40-0.60 on most scenarios: a single run often looks fine, pass^5 is 0.00 everywhere:
 ```
 scenario                  pass@1  pass^5  dup_writes  replayed  violations  faults
-return_full_item            0.20    0.00           5         0         n/a       5
-return_partial              0.20    0.00           5         0         n/a       5
-walk_in_order               0.20    0.00           5         0         n/a       5
-promo_then_order            0.00    0.00           8         0         n/a       9
-restock                     0.20    0.00           5         0         n/a       5
-over_return_seeded          0.00    0.00          10         0         n/a       5
-cross_turn_legit            0.00    0.00           8         0         n/a       9
-cross_turn_over_return      0.00    0.00          13         0         n/a       9
+return_full_item            0.60    0.00           3         0         n/a       4
+return_partial              0.40    0.00           4         0         n/a       9
+walk_in_order               0.60    0.00           2         0         n/a       4
+promo_then_order            0.00    0.00          14         0         n/a      16
+restock                     0.60    0.00           2         0         n/a       2
+receive_partial_po          0.40    0.00           3         0         n/a       4
+over_return_seeded          0.00    0.00           7         0         n/a       4
+cross_turn_legit            0.60    0.00           2         0         n/a       2
+cross_turn_over_return      0.00    0.00           8         0         n/a       5
 
-OVERALL  pass^5 (avg) = 0.00   duplicate writes = 59   violations = n/a
+OVERALL  pass^5 (avg) = 0.00   duplicate writes = 45   violations = n/a
 ```
 
-DB fixes only, guard off (violations still n/a, no guard yet):
+DB fixes only, guard off (invariants are still measured, the ledger is just not in the path):
 ```
 scenario                  pass@1  pass^5  dup_writes  replayed  violations  faults
-return_full_item            1.00    1.00           0         0         n/a       5
-return_partial              0.20    0.00           5         0         n/a       5
-walk_in_order               0.20    0.00           5         0         n/a       5
-promo_then_order            0.00    0.00           8         0         n/a       9
-restock                     1.00    1.00           0         0         n/a       5
-over_return_seeded          1.00    1.00           0         0         n/a       5
-cross_turn_legit            0.00    0.00           5         0         n/a       9
-cross_turn_over_return      1.00    1.00           0         0         n/a       9
+return_full_item            1.00    1.00           0         0           0       4
+return_partial              0.40    0.00           4         0           0       9
+walk_in_order               0.60    0.00           2         0           0       4
+promo_then_order            0.00    0.00          14         0           0      16
+restock                     1.00    1.00           0         0           0       2
+receive_partial_po          0.40    0.00           3         0           0       4
+over_return_seeded          1.00    1.00           0         0           0       4
+cross_turn_legit            0.60    0.00           2         0           0       2
+cross_turn_over_return      1.00    1.00           0         0           0       5
 
-OVERALL  pass^5 (avg) = 0.50   duplicate writes = 23   violations = n/a
+OVERALL  pass^5 (avg) = 0.44   duplicate writes = 25   violations = 0
 ```
 
 DB fixes + guard on:
 ```
 scenario                  pass@1  pass^5  dup_writes  replayed  violations  faults
-return_full_item            1.00    1.00           0         4           0       5
-return_partial              1.00    1.00           0         4           0       5
-walk_in_order               1.00    1.00           0         4           0       5
-promo_then_order            1.00    1.00           0         7           0       9
-restock                     1.00    1.00           0         4           0       5
-over_return_seeded          1.00    1.00           0         0           0       5
-cross_turn_legit            1.00    1.00           0         7           0       9
-cross_turn_over_return      1.00    1.00           0         4           0       9
+return_full_item            1.00    1.00           0         2           0       4
+return_partial              1.00    1.00           0         3           0       9
+walk_in_order               1.00    1.00           0         1           0       4
+promo_then_order            1.00    1.00           0         8           0      16
+restock                     1.00    1.00           0         2           0       2
+receive_partial_po          1.00    1.00           0         3           0       4
+over_return_seeded          1.00    1.00           0         0           0       4
+cross_turn_legit            1.00    1.00           0         2           0       2
+cross_turn_over_return      1.00    1.00           0         1           0       5
 
 OVERALL  pass^5 (avg) = 1.00   duplicate writes = 0   violations = 0
 ✓ GATE PASSED
@@ -76,18 +79,22 @@ OVERALL  pass^5 (avg) = 1.00   duplicate writes = 0   violations = 0
 
 | Configuration | pass^5 (avg) | Duplicate writes |
 |---|---|---|
-| Original code | 0.00 | 59 |
-| DB fixes only | 0.50 | 23 |
+| Original code | 0.00 | 45 |
+| DB fixes only | 0.44 | 25 |
 | DB fixes + guard | 1.00 | 0 |
 
-The guard also held at k=20 across seeds 1, 2, 3, 42 and 99.
+At k=20 the gate holds for seeds 1, 2, 3 and 99. Seed 42 scores 0.89: in one `return_partial` run the backend returned three malformed responses in a row, the agent used up its two retries and gave up. Zero duplicates and zero violations, so correctness held, but the customer's return never happened. That is a liveness failure, not a safety one, and the guard is not meant to fix it. The fix belongs in the agent: a retry budget with backoff, and telling the user plainly that the action did not go through.
 
-Why DB fixes alone stop at 0.50: a duplicate order or promotion looks exactly like a legitimate one at the DB level. Same items, same dates, valid quantities. Only the request's identity (call id, or intent within a turn) tells them apart.
+**Honest caveat:** the scripted agent retries with byte-identical arguments, so the intent key always matches. A real model may change arguments on retry (add a default date, send `"1"` instead of `1`). Then the intent key misses and only the DB rules are left, which cannot catch a duplicate order. Treat the scripted numbers as an upper bound; `--agent claude` is the real test.
+
+Why DB fixes alone stop at 0.44: a duplicate order or promotion looks exactly like a legitimate one at the DB level. Same items, same dates, valid quantities. Only the request's identity (call id, or intent within a turn) tells them apart.
 
 ## 5. Trade-offs I chose
 
 - **Intent key scope is per user turn.** Two identical orders in one turn get deduped. The same order in a later turn is allowed. The `cross_turn_legit` scenario covers that. The cost: a user who really wants two identical orders in one message has to be told to split them.
 - **Invariants detect and alarm. They do not roll back.** Enforcement belongs in the DB transaction (the trigger and preconditions). The invariants catch what the enforcement missed, and they page someone.
+- **The transport key is `turn_id:call_id`, and a reused key with different arguments is rejected, not replayed.** Some providers reuse call ids (Gemini uses the function name), and replaying an old result for a different request would silently drop it. Stripe returns 422 for the same case.
+- **Only case-insensitive fields are lowercased in the intent key** (sku, condition, supplier and product names). Lowercasing an order id or a description could merge two different requests.
 - **The ledger claim and the tool transaction are separate.** If the process crashes between them, an `in_progress` row is left behind and that call stays blocked. This is the known gap. See the lease in section 6.
 
 ## 6. At AWS scale
@@ -102,9 +109,9 @@ Why DB fixes alone stop at 0.50: a duplicate order or promotion looks exactly li
 
 ```bash
 python3 tests/test_tools.py && python3 tests/test_guard.py      # deterministic, no API key
-python3 -m evals.runner --guard off --k 5                       # DB fixes only: pass^5 0.50 on HEAD
+python3 -m evals.runner --guard off --k 5                       # DB fixes only: pass^5 0.44 on HEAD
 python3 -m evals.runner --guard on  --k 5                       # gate must pass
 python3 -m evals.runner --guard on  --k 3 --agent claude        # live; needs ANTHROPIC_API_KEY + pip install anthropic
 ```
 
-To see the original numbers, run the same harness at commit c1cbafd, before the DB fixes. The scripted agent is deterministic on purpose. It retries the way real LLMs do (same name and args, new call id), so every result is reproducible and CI can gate on it. `--agent claude` runs the same scenarios against a live model.
+To see the original-code numbers, copy the repo and restore `agent/tools.py` and `agent/db.py` from commit aba6d92, then run the guard-off command there. The scripted agent is deterministic on purpose. It retries the way real LLMs do (same name and args, new call id), so every result is reproducible and CI can gate on it. `--agent claude` runs the same scenarios against a live model.

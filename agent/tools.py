@@ -321,6 +321,7 @@ def get_order(order_id):
 # ── Tool: create_return ───────────────────────────────────────────────────────
 
 def create_return(order_id, sku, quantity, condition, return_date=None):
+    condition = str(condition).strip().lower()  # 'Good' must restore inventory too
     if not return_date:
         return_date = _today()
 

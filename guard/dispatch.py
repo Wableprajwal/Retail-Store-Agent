@@ -4,7 +4,10 @@ Guarded dispatch: wraps agent.tools.dispatch so write tools are idempotent.
   dispatch_fn(tool_name, tool_input, ctx) -> dict      ctx = {"call_id", "turn_id"}
 
 Two keys, two kinds of duplicate:
-  idem_key   = ctx["call_id"]   transport retry (same call delivered twice)
+  idem_key   = turn_id:call_id  transport retry (same call delivered twice). Scoped to the
+                                turn because some providers reuse ids (Gemini uses the
+                                function name). A reused key with different args is
+                                rejected, never replayed (Stripe returns 422 for this).
   intent_key = sha256(turn_id | tool | normalized args)
                                 model retry (new call id, same write, same user turn)
 Scope trade-off: two genuinely identical writes in one turn are treated as one.
@@ -26,14 +29,20 @@ WRITE_TOOLS = {"create_order", "create_return", "create_restock_orders",
 log = logging.getLogger("guard")
 
 
-def _normalize(value):
-    """Strip + lowercase strings, drop None-valued keys, recurse into dicts/lists."""
+# Only fields the tools themselves treat case-insensitively are lowercased; anything
+# else (ids, descriptions) could change behaviour, so merging them would be wrong.
+CASE_INSENSITIVE = {"sku", "condition", "supplier_name", "product_name"}
+
+
+def _normalize(value, key=None):
+    """Strip strings, lowercase case-insensitive fields, drop None-valued keys, recurse."""
     if isinstance(value, str):
-        return value.strip().lower()
+        value = value.strip()
+        return value.lower() if key in CASE_INSENSITIVE else value
     if isinstance(value, dict):
-        return {k: _normalize(v) for k, v in value.items() if v is not None}
+        return {k: _normalize(v, k) for k, v in value.items() if v is not None}
     if isinstance(value, (list, tuple)):
-        return [_normalize(v) for v in value]
+        return [_normalize(v, key) for v in value]
     return value
 
 
@@ -60,11 +69,14 @@ def make_dispatch(guard=True):
         if name not in WRITE_TOOLS:
             return tools.dispatch(name, copy.deepcopy(tool_input))
 
-        idem = ctx["call_id"]
+        idem = f"{ctx['turn_id']}:{ctx['call_id']}"
         intent = intent_key(ctx["turn_id"], name, tool_input)
         args_json = json.dumps(tool_input, sort_keys=True, default=str)
 
         status, row = ledger.claim(idem, intent, name, args_json)
+        if (status != "claimed" and row["matched_on"] == "idem_key"
+                and (row["tool"], row["args_json"]) != (name, args_json)):
+            return {"error": "idempotency key reused with different arguments; not executed"}
         if status == "completed":
             return _replay(row)
         if status == "in_progress":

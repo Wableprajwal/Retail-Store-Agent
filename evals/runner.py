@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import tempfile
+import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -86,7 +87,9 @@ def run_once(scenario, run_idx, args, make_dispatch):
                 counter["writes"] += 1
             return result
 
-        faults = FaultInjector(args.seed + run_idx)
+        # Independent fault stream per (seed, scenario, run) so scenarios don't all see
+        # the same fault on their first write. crc32 is stable across processes; hash() isn't.
+        faults = FaultInjector(zlib.crc32(f"{args.seed}|{scenario['id']}|{run_idx}".encode()))
         dispatch_fn = faults.wrap(counting)
 
         if args.agent == "claude":
@@ -184,6 +187,10 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--gate")
     args = ap.parse_args()
+
+    if args.agent == "claude":
+        from agent.config import load_env
+        load_env()  # pick up ANTHROPIC_API_KEY from .env like main.py does
 
     make_dispatch = None
     if args.guard == "on":

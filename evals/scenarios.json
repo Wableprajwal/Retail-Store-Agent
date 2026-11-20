@@ -69,6 +69,21 @@
     ]
   },
   {
+    "id": "receive_partial_po",
+    "description": "Restock, then receive 20 of the 50 totes ordered; a duplicate receive would double-count stock",
+    "expected_writes": 2,
+    "turns": [
+      {"user": "Please reorder everything that's below its reorder point. Use 2026-06-01 as the order date.",
+       "script": [{"tool": "create_restock_orders", "input": {"order_date": "2026-06-01"}}]},
+      {"user": "20 Canvas Totes just arrived from that order, received 2026-06-05.",
+       "script": [{"tool": "receive_purchase_order", "input": {"product_name": "Canvas Tote", "qty_received": 20, "receive_date": "2026-06-05"}}]}
+    ],
+    "checks": [
+      {"name": "TOTE inventory +20", "sql": "SELECT on_hand_qty FROM inventory WHERE sku='TOTE'", "expect_delta": 20},
+      {"name": "PO received exactly 20", "sql": "SELECT COALESCE(SUM(qty_received),0) FROM purchase_orders WHERE product_id='P-TOTE'", "expect": 20}
+    ]
+  },
+  {
     "id": "over_return_seeded",
     "description": "O-1006 HOOD-NVY-L sold 2, 1 already returned (R-2001); returning 2 must be rejected",
     "expected_writes": 0,
