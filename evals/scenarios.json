@@ -1,0 +1,111 @@
+[
+  {
+    "id": "return_full_item",
+    "description": "Return the single HOOD-GRY-M from O-1004 in good condition",
+    "expected_writes": 1,
+    "turns": [
+      {"user": "Customer is returning the gray medium hoodie from order O-1004, it's in good condition. Please process it.",
+       "script": [{"tool": "create_return", "input": {"order_id": "O-1004", "sku": "HOOD-GRY-M", "quantity": 1, "condition": "good", "return_date": "2026-06-01"}}]}
+    ],
+    "checks": [
+      {"name": "one return row for O-1004", "sql": "SELECT COUNT(*) FROM returns WHERE order_id='O-1004'", "expect": 1},
+      {"name": "refund total is 60.0", "sql": "SELECT COALESCE(SUM(refund_amount),0) FROM returns WHERE order_id='O-1004'", "expect": 60.0},
+      {"name": "inventory +1", "sql": "SELECT on_hand_qty FROM inventory WHERE sku='HOOD-GRY-M'", "expect_delta": 1}
+    ]
+  },
+  {
+    "id": "return_partial",
+    "description": "Return 1 of the 3 TEE-BLU-M bought on O-1008",
+    "expected_writes": 1,
+    "turns": [
+      {"user": "Someone is bringing back one of the blue medium tees from order O-1008. Good condition.",
+       "script": [{"tool": "create_return", "input": {"order_id": "O-1008", "sku": "TEE-BLU-M", "quantity": 1, "condition": "good", "return_date": "2026-06-01"}}]}
+    ],
+    "checks": [
+      {"name": "one return row", "sql": "SELECT COUNT(*) FROM returns WHERE order_id='O-1008'", "expect": 1},
+      {"name": "returned qty is 1", "sql": "SELECT COALESCE(SUM(quantity),0) FROM returns WHERE order_id='O-1008' AND sku='TEE-BLU-M'", "expect": 1}
+    ]
+  },
+  {
+    "id": "walk_in_order",
+    "description": "Ring up one mug for a walk-in, cash",
+    "expected_writes": 1,
+    "turns": [
+      {"user": "Ring up one ceramic mug, cash, walk-in customer, dated 2026-06-01.",
+       "script": [{"tool": "create_order", "input": {"items": [{"sku": "MUG", "quantity": 1}], "payment_method": "cash", "order_date": "2026-06-01"}}]}
+    ],
+    "checks": [
+      {"name": "orders +1", "sql": "SELECT COUNT(*) FROM orders", "expect_delta": 1},
+      {"name": "MUG inventory -1", "sql": "SELECT on_hand_qty FROM inventory WHERE sku='MUG'", "expect_delta": -1}
+    ]
+  },
+  {
+    "id": "promo_then_order",
+    "description": "Create a hoodie promotion and ring up an order in the same turn",
+    "expected_writes": 2,
+    "turns": [
+      {"user": "Set up a 20% off hoodies promo for June 2026, then ring up one ceramic mug for cash on 2026-06-01.",
+       "script": [
+         {"tool": "create_promotion", "input": {"description": "Hoodie 20% off", "type": "percent_off", "value": 20, "scope_type": "product", "scope_ref": "P-HOOD", "start_date": "2026-06-01", "end_date": "2026-06-30"}},
+         {"tool": "create_order", "input": {"items": [{"sku": "MUG", "quantity": 1}], "payment_method": "cash", "order_date": "2026-06-01"}}
+       ]}
+    ],
+    "checks": [
+      {"name": "promotions +1", "sql": "SELECT COUNT(*) FROM promotions", "expect_delta": 1},
+      {"name": "orders +1", "sql": "SELECT COUNT(*) FROM orders", "expect_delta": 1}
+    ]
+  },
+  {
+    "id": "restock",
+    "description": "Run restock for 2026-06-01; one PO per low product, no duplicates",
+    "expected_writes": 1,
+    "turns": [
+      {"user": "Please reorder everything that's below its reorder point. Use 2026-06-01 as the order date.",
+       "script": [{"tool": "create_restock_orders", "input": {"order_date": "2026-06-01"}}]}
+    ],
+    "checks": [
+      {"name": "max open POs per product is 1", "sql": "SELECT COALESCE(MAX(c),0) FROM (SELECT COUNT(*) c FROM purchase_orders WHERE status='open' GROUP BY product_id)", "expect": 1},
+      {"name": "PO count +1 (clean run on seed data)", "sql": "SELECT COUNT(*) FROM purchase_orders", "expect_delta": 1}
+    ]
+  },
+  {
+    "id": "over_return_seeded",
+    "description": "O-1006 HOOD-NVY-L sold 2, 1 already returned (R-2001); returning 2 must be rejected",
+    "expected_writes": 0,
+    "turns": [
+      {"user": "Return 2 navy large hoodies from order O-1006, good condition.",
+       "script": [{"tool": "create_return", "input": {"order_id": "O-1006", "sku": "HOOD-NVY-L", "quantity": 2, "condition": "good", "return_date": "2026-06-01"}}]}
+    ],
+    "checks": [
+      {"name": "return rows unchanged", "sql": "SELECT COUNT(*) FROM returns WHERE order_id='O-1006' AND sku='HOOD-NVY-L'", "expect_delta": 0}
+    ]
+  },
+  {
+    "id": "cross_turn_legit",
+    "description": "Two separate turns each return 1 of 3 TEE-BLU-M; both are legitimate",
+    "expected_writes": 2,
+    "turns": [
+      {"user": "Return one blue medium tee from order O-1008, good condition.",
+       "script": [{"tool": "create_return", "input": {"order_id": "O-1008", "sku": "TEE-BLU-M", "quantity": 1, "condition": "good", "return_date": "2026-06-01"}}]},
+      {"user": "Another customer is returning one more blue medium tee from order O-1008, good condition.",
+       "script": [{"tool": "create_return", "input": {"order_id": "O-1008", "sku": "TEE-BLU-M", "quantity": 1, "condition": "good", "return_date": "2026-06-01"}}]}
+    ],
+    "checks": [
+      {"name": "two return rows", "sql": "SELECT COUNT(*) FROM returns WHERE order_id='O-1008' AND sku='TEE-BLU-M'", "expect": 2}
+    ]
+  },
+  {
+    "id": "cross_turn_over_return",
+    "description": "Two turns each return the only HOOD-GRY-M sold on O-1004; second must be rejected",
+    "expected_writes": 1,
+    "turns": [
+      {"user": "Return the gray medium hoodie from order O-1004, good condition.",
+       "script": [{"tool": "create_return", "input": {"order_id": "O-1004", "sku": "HOOD-GRY-M", "quantity": 1, "condition": "good", "return_date": "2026-06-01"}}]},
+      {"user": "Please return the gray medium hoodie from order O-1004 again, good condition.",
+       "script": [{"tool": "create_return", "input": {"order_id": "O-1004", "sku": "HOOD-GRY-M", "quantity": 1, "condition": "good", "return_date": "2026-06-01"}}]}
+    ],
+    "checks": [
+      {"name": "exactly one return row", "sql": "SELECT COUNT(*) FROM returns WHERE order_id='O-1004'", "expect": 1}
+    ]
+  }
+]

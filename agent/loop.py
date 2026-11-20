@@ -1,9 +1,11 @@
+import copy
 import json
 import time
+import uuid
 
 from .prompts import SYSTEM_PROMPT
 from .tool_definitions import TOOLS
-from .tools import dispatch
+from . import tools
 from .llm import get_client
 
 
@@ -20,9 +22,66 @@ def _chat_with_retry(client, history, retries=2):
             time.sleep(wait)
 
 
+def run_turn(client, history, user_text, dispatch_fn, turn_id, max_steps=12, log=print):
+    """Run one user turn: call the LLM until it stops requesting tools.
+
+    dispatch_fn(name, input, ctx) -> result dict, ctx = {"call_id", "turn_id"}.
+    Returns {"text": str, "tool_calls": [{"name", "input", "result", "call_id"}]}.
+    """
+    client.append_user(history, user_text)
+    calls = []
+    text = ""
+
+    for _ in range(max_steps):
+        try:
+            response = _chat_with_retry(client, history)
+        except Exception as e:
+            log(f"\n[LLM request failed: {e}]\n")
+            break
+
+        client.append_assistant(history, response)
+
+        if client.is_tool_use(response):
+            tool_results = []
+            for tc in client.get_tool_calls(response):
+                log(f"  [tool: {tc['name']}({json.dumps(tc['input'])})]")
+                ctx = {"call_id": tc["id"], "turn_id": turn_id}
+                result = dispatch_fn(tc["name"], tc["input"], ctx)
+                calls.append({"name": tc["name"], "input": tc["input"],
+                              "result": result, "call_id": tc["id"]})
+                tool_results.append({"id": tc["id"], "content": json.dumps(result)})
+            client.append_tool_results(history, tool_results)
+
+        elif client.is_end_turn(response):
+            text = client.get_text(response)
+            if text:
+                log(f"\nAgent: {text}\n")
+            break
+
+        else:
+            log("[No further response from model]")
+            break
+
+    return {"text": text, "tool_calls": calls}
+
+
+def _baseline_dispatch(name, tool_input, ctx):
+    # deepcopy: create_order mutates its items in place
+    return tools.dispatch(name, copy.deepcopy(tool_input))
+
+
 def run_agent_loop(provider=None):
     client = get_client(provider)
     conversation_history = []
+
+    try:
+        from guard.dispatch import make_dispatch
+        dispatch_fn = make_dispatch(guard=True)
+    except ImportError:
+        dispatch_fn = _baseline_dispatch
+
+    session = uuid.uuid4().hex[:6]
+    turn_n = 0
 
     print(f"Retail Store Agent ready [{client.provider_name()}]")
     print("Type your instruction ('exit' or Ctrl+C to quit).\n")
@@ -40,33 +99,6 @@ def run_agent_loop(provider=None):
             print("Goodbye.")
             break
 
-        client.append_user(conversation_history, user_input)
-
-        # Agentic loop: keep calling the LLM until it stops requesting tools
-        while True:
-            try:
-                response = _chat_with_retry(client, conversation_history)
-            except Exception as e:
-                print(f"\n[LLM request failed: {e}]\n")
-                break
-
-            client.append_assistant(conversation_history, response)
-
-            if client.is_tool_use(response):
-                tool_calls = client.get_tool_calls(response)
-                tool_results = []
-                for tc in tool_calls:
-                    print(f"  [tool: {tc['name']}({json.dumps(tc['input'])})]")
-                    result = dispatch(tc["name"], tc["input"])
-                    tool_results.append({"id": tc["id"], "content": json.dumps(result)})
-                client.append_tool_results(conversation_history, tool_results)
-
-            elif client.is_end_turn(response):
-                text = client.get_text(response)
-                if text:
-                    print(f"\nAgent: {text}\n")
-                break
-
-            else:
-                print("[No further response from model]")
-                break
+        turn_n += 1
+        run_turn(client, conversation_history, user_input, dispatch_fn,
+                 f"cli-{session}-{turn_n}")
