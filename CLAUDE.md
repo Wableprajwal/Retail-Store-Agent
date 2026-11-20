@@ -130,10 +130,15 @@ python main.py                                                # interactive CLI 
 
 - [x] Branch `reliability-guard` created; baseline 16/16 tests pass.
 - [x] CLAUDE.md handoff written; draft PR opened.
-- [ ] Eval harness (faults, scripted agent, scenarios, runner, `run_turn` refactor): guard off shows bugs.
-- [ ] Guard (ledger, intent key, invariants, guarded dispatch) + `--guard on`.
-- [ ] DB-level fixes for bugs 1-3 + `tests/test_guard.py`.
-- [ ] CI gate (`thresholds.json` + workflow).
+- [x] Eval harness (faults, scripted agent, scenarios, runner, `run_turn` refactor): guard off shows bugs.
+      Original code: pass^5 avg 0.00, 59 duplicate writes. (commit c1cbafd)
+- [x] DB-level fixes for bugs 1-3. Guard off: pass^5 avg 0.50, 23 duplicate writes. (commit 6612fcb)
+      Note: these fixes apply with the guard off too, so `--guard off` on HEAD shows the "DB fixes only" picture.
+      To reproduce the original numbers, run the harness at commit c1cbafd.
+- [x] Guard (ledger, intent key, invariants, guarded dispatch) + `tests/test_guard.py` (11 tests).
+      Guard on: pass^5 1.00, 0 duplicate writes; also holds at k=20 for seeds 1,2,3,42,99. (commit da9098a)
+- [x] CI gate (`evals/thresholds.json` + `.github/workflows/eval.yml`).
+- Shell note: the dev machine has `python3`, not `python`.
 - [ ] RELIABILITY.md with real before/after numbers; README section.
 - [ ] Opus code review of the full diff; fixes applied.
 - [ ] Live Claude run (optional; no API key on the dev machine at time of writing).

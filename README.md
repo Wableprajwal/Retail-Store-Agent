@@ -16,6 +16,21 @@ Agent: Created promotion PR-2 (20% off hoodies, Jun 20–22) and rang up order
        applied, the price is $48.00 (down from $60.00).
 ```
 
+## Reliability: idempotency guard and fault-injection evals
+
+Agents that take real actions retry and repeat themselves. This repo has a
+fault-injection eval that scores pass^k, not pass@1, plus a guard (idempotency
+ledger, per-turn intent keys, DB-level rules, invariant alarms). Against the
+original tools pass^5 was 0.00 with 59 duplicate writes; with the guard it is
+1.00 with 0.
+
+```bash
+python3 -m evals.runner --guard off --k 5    # DB fixes only (pass^5 0.50)
+python3 -m evals.runner --guard on  --k 5    # gate passes
+```
+
+Details and full results: [RELIABILITY.md](RELIABILITY.md).
+
 ## Quick start
 
 ```bash
