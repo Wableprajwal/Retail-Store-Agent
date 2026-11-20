@@ -1,0 +1,35 @@
+name: tests-and-eval-gate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Everything below is deterministic and needs no API key or extra packages.
+      - name: Business-rule tests
+        run: python tests/test_tools.py
+
+      - name: Guard tests
+        run: python tests/test_guard.py
+
+      - name: Eval gate (guard on, fault injection, pass^5)
+        run: python -m evals.runner --guard on --k 5 --gate evals/thresholds.json --json eval-results.json
+
+      - name: Baseline for comparison (guard off, expected to fail; never blocks)
+        if: always()
+        continue-on-error: true
+        run: python -m evals.runner --guard off --k 5
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: eval-results.json
