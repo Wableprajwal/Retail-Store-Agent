@@ -4,7 +4,9 @@ import os
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "store.db")
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout = busy wait (seconds) for the write lock, so concurrent writers queue
+    # behind BEGIN IMMEDIATE instead of failing with 'database is locked'.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -107,6 +109,29 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
     qty_ordered INTEGER NOT NULL,
     qty_received INTEGER NOT NULL DEFAULT 0,
     status      TEXT NOT NULL DEFAULT 'open'  -- 'open' or 'closed'
+);
+
+-- DB-level backstop for the returns rule: total returned per order/sku can never
+-- exceed units sold. The tool checks first (friendly error); this catches anything else.
+CREATE TRIGGER IF NOT EXISTS returns_not_exceed_sold
+BEFORE INSERT ON returns
+WHEN COALESCE((SELECT SUM(quantity) FROM returns
+               WHERE order_id = NEW.order_id AND sku = NEW.sku), 0) + NEW.quantity
+     > COALESCE((SELECT SUM(quantity) FROM order_lines
+                 WHERE order_id = NEW.order_id AND sku = NEW.sku), 0)
+BEGIN
+    SELECT RAISE(ABORT, 'return exceeds quantity sold minus prior returns');
+END;
+
+-- Idempotency ledger for write tools (see guard/ledger.py)
+CREATE TABLE IF NOT EXISTS tool_ledger (
+    idem_key    TEXT PRIMARY KEY,
+    intent_key  TEXT NOT NULL UNIQUE,
+    tool        TEXT NOT NULL,
+    args_json   TEXT NOT NULL,
+    status      TEXT NOT NULL,   -- 'in_progress' or 'completed'
+    result_json TEXT,
+    created_at  TEXT NOT NULL
 );
 """
 

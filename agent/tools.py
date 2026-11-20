@@ -1,11 +1,32 @@
 import difflib
 import math
+from contextlib import contextmanager
 from .db import get_conn
 
 TODAY = "2026-06-19"  # Hardcoded for testing; in real life, use date.today().isoformat()
 
 def _today():
     return TODAY
+
+@contextmanager
+def _write_txn(conn):
+    """
+    Open a write transaction with BEGIN IMMEDIATE, so the write lock is taken
+    *before* any read (MAX(id), stock checks, prior returns). With Python's
+    default deferred transactions two writers can both read the same MAX(id)
+    and one then fails on the PK or with 'database is locked'. Waiting for the
+    lock (busy timeout set in get_conn) serializes writers instead. Commits on
+    normal exit (including early error returns, which wrote nothing), rolls
+    back on exception.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")
 
 def _next_id(conn, table, prefix, id_col):
     """
@@ -161,7 +182,7 @@ def create_order(items, payment_method, customer_id=None,
         customer_id = None
 
     conn = get_conn()
-    with conn:
+    with _write_txn(conn):
         # Resolve SKUs tolerantly, then validate quantities and stock
         for item in items:
             resolved, err = _resolve_sku(conn, item["sku"])
@@ -304,7 +325,7 @@ def create_return(order_id, sku, quantity, condition, return_date=None):
         return_date = _today()
 
     conn = get_conn()
-    with conn:
+    with _write_txn(conn):
         order = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
         if not order:
             return {"error": f"Order {order_id} not found"}
@@ -324,8 +345,18 @@ def create_return(order_id, sku, quantity, condition, return_date=None):
         if not line:
             return {"error": f"SKU {sku} not found on order {order_id}"}
 
-        if quantity > line["quantity"]:
-            return {"error": f"Cannot return {quantity} units; only {line['quantity']} were sold"}
+        # Business rule: total returned (prior + this) can never exceed units sold.
+        # The returns_not_exceed_sold trigger is the DB-level backstop.
+        sold = conn.execute(
+            "SELECT COALESCE(SUM(quantity), 0) FROM order_lines WHERE order_id=? AND sku=?",
+            (order_id, sku)
+        ).fetchone()[0]
+        prior = conn.execute(
+            "SELECT COALESCE(SUM(quantity), 0) FROM returns WHERE order_id=? AND sku=?",
+            (order_id, sku)
+        ).fetchone()[0]
+        if quantity + prior > sold:
+            return {"error": f"Cannot return {quantity} units; {sold} sold, {prior} already returned"}
 
         # Business rule: refund = price actually paid (after order discount)
         discount = order["order_discount_pct"]
@@ -394,7 +425,11 @@ def create_restock_orders(order_date=None):
         order_date = _today()
 
     conn = get_conn()
+    with _write_txn(conn):
+        return _create_restock_orders(conn, order_date)
 
+
+def _create_restock_orders(conn, order_date):
     # Find SKUs needing restock
     below_reorder = conn.execute("""
         SELECT i.sku, s.product_id, i.on_hand_qty, i.reorder_point, i.reorder_qty
@@ -415,42 +450,56 @@ def create_restock_orders(order_date=None):
         product_qtys[pid] += row["reorder_qty"]
 
     created = []
-    with conn:
-        for product_id, total_qty in product_qtys.items():
-            # Best supplier: lowest cost, lead_time <= 10
-            supplier = conn.execute("""
-                SELECT sc.supplier_id, s.supplier_name, sc.unit_cost, sc.lead_time_days
-                FROM supplier_catalog sc
-                JOIN suppliers s ON sc.supplier_id = s.supplier_id
-                WHERE sc.product_id=? AND sc.lead_time_days <= 10
-                ORDER BY sc.unit_cost ASC
-                LIMIT 1
-            """, (product_id,)).fetchone()
+    skipped = []
+    for product_id, total_qty in product_qtys.items():
+        # Business rule: one open PO per product. A repeat call must not
+        # stack a second PO on top of one that is still outstanding.
+        open_po = conn.execute(
+            "SELECT po_id FROM purchase_orders WHERE product_id=? AND status='open'",
+            (product_id,)
+        ).fetchone()
+        if open_po:
+            skipped.append({"product_id": product_id, "open_po_id": open_po["po_id"],
+                            "reason": "product already has an open purchase order"})
+            continue
 
-            if not supplier:
-                created.append({
-                    "product_id": product_id,
-                    "error": "No eligible supplier (all have lead_time > 10)"
-                })
-                continue
+        # Best supplier: lowest cost, lead_time <= 10
+        supplier = conn.execute("""
+            SELECT sc.supplier_id, s.supplier_name, sc.unit_cost, sc.lead_time_days
+            FROM supplier_catalog sc
+            JOIN suppliers s ON sc.supplier_id = s.supplier_id
+            WHERE sc.product_id=? AND sc.lead_time_days <= 10
+            ORDER BY sc.unit_cost ASC
+            LIMIT 1
+        """, (product_id,)).fetchone()
 
-            po_id = _next_id(conn, "purchase_orders", "PO-", "po_id")
-            conn.execute(
-                "INSERT INTO purchase_orders VALUES (?,?,?,NULL,?,?,0,'open')",
-                (po_id, supplier["supplier_id"], product_id, order_date, total_qty)
-            )
-
+        if not supplier:
             created.append({
-                "po_id": po_id,
                 "product_id": product_id,
-                "supplier": supplier["supplier_name"],
-                "unit_cost": supplier["unit_cost"],
-                "lead_time_days": supplier["lead_time_days"],
-                "qty_ordered": total_qty,
-                "order_date": order_date
+                "error": "No eligible supplier (all have lead_time > 10)"
             })
+            continue
 
-    return {"purchase_orders": created}
+        po_id = _next_id(conn, "purchase_orders", "PO-", "po_id")
+        conn.execute(
+            "INSERT INTO purchase_orders VALUES (?,?,?,NULL,?,?,0,'open')",
+            (po_id, supplier["supplier_id"], product_id, order_date, total_qty)
+        )
+
+        created.append({
+            "po_id": po_id,
+            "product_id": product_id,
+            "supplier": supplier["supplier_name"],
+            "unit_cost": supplier["unit_cost"],
+            "lead_time_days": supplier["lead_time_days"],
+            "qty_ordered": total_qty,
+            "order_date": order_date
+        })
+
+    result = {"purchase_orders": created}
+    if skipped:
+        result["skipped"] = skipped
+    return result
 
 
 # ── Tool: receive_purchase_order ──────────────────────────────────────────────
@@ -461,7 +510,13 @@ def receive_purchase_order(qty_received, supplier_name=None, product_name=None,
         receive_date = _today()
 
     conn = get_conn()
+    with _write_txn(conn):
+        return _receive_purchase_order(conn, qty_received, supplier_name,
+                                       product_name, qty_ordered, receive_date)
 
+
+def _receive_purchase_order(conn, qty_received, supplier_name, product_name,
+                            qty_ordered, receive_date):
     # Find the matching open PO
     sql = """
         SELECT po.*, s.supplier_name, p.product_name
@@ -497,29 +552,28 @@ def receive_purchase_order(qty_received, supplier_name=None, product_name=None,
         if not sup or not prod:
             return {"error": "Could not find matching open purchase order or supplier/product"}
 
-        with conn:
-            po_id = _next_id(conn, "purchase_orders", "PO-", "po_id")
-            ordered = qty_ordered or qty_received
+        po_id = _next_id(conn, "purchase_orders", "PO-", "po_id")
+        ordered = qty_ordered or qty_received
+        conn.execute(
+            "INSERT INTO purchase_orders VALUES (?,?,?,NULL,?,?,?,'open')",
+            (po_id, sup["supplier_id"], prod["product_id"],
+             receive_date, ordered, qty_received)
+        )
+        # Increment inventory for all SKUs of this product
+        skus = conn.execute(
+            "SELECT sku FROM skus WHERE product_id=?", (prod["product_id"],)
+        ).fetchall()
+        # For goods (single SKU), update directly
+        if len(skus) == 1:
             conn.execute(
-                "INSERT INTO purchase_orders VALUES (?,?,?,NULL,?,?,?,'open')",
-                (po_id, sup["supplier_id"], prod["product_id"],
-                 receive_date, ordered, qty_received)
+                "UPDATE inventory SET on_hand_qty = on_hand_qty + ? WHERE sku=?",
+                (qty_received, skus[0]["sku"])
             )
-            # Increment inventory for all SKUs of this product
-            skus = conn.execute(
-                "SELECT sku FROM skus WHERE product_id=?", (prod["product_id"],)
-            ).fetchall()
-            # For goods (single SKU), update directly
-            if len(skus) == 1:
-                conn.execute(
-                    "UPDATE inventory SET on_hand_qty = on_hand_qty + ? WHERE sku=?",
-                    (qty_received, skus[0]["sku"])
-                )
-            status = "closed" if qty_received >= ordered else "open"
-            conn.execute(
-                "UPDATE purchase_orders SET status=? WHERE po_id=?",
-                (status, po_id)
-            )
+        status = "closed" if qty_received >= ordered else "open"
+        conn.execute(
+            "UPDATE purchase_orders SET status=? WHERE po_id=?",
+            (status, po_id)
+        )
         return {
             "po_id": po_id,
             "product": prod["product_name"],
@@ -531,29 +585,28 @@ def receive_purchase_order(qty_received, supplier_name=None, product_name=None,
         }
 
     # Update existing PO
-    with conn:
-        outstanding = po["qty_ordered"] - po["qty_received"]
-        if qty_received > outstanding:
-            return {"error": f"Cannot receive {qty_received} units against {po['po_id']}: "
-                             f"only {outstanding} of {po['qty_ordered']} ordered are still outstanding "
-                             f"({po['qty_received']} already received)"}
-        new_received = po["qty_received"] + qty_received
-        status = "closed" if new_received >= po["qty_ordered"] else "open"
-        conn.execute("""
-            UPDATE purchase_orders
-            SET qty_received=?, status=?
-            WHERE po_id=?
-        """, (new_received, status, po["po_id"]))
+    outstanding = po["qty_ordered"] - po["qty_received"]
+    if qty_received > outstanding:
+        return {"error": f"Cannot receive {qty_received} units against {po['po_id']}: "
+                         f"only {outstanding} of {po['qty_ordered']} ordered are still outstanding "
+                         f"({po['qty_received']} already received)"}
+    new_received = po["qty_received"] + qty_received
+    status = "closed" if new_received >= po["qty_ordered"] else "open"
+    conn.execute("""
+        UPDATE purchase_orders
+        SET qty_received=?, status=?
+        WHERE po_id=?
+    """, (new_received, status, po["po_id"]))
 
-        # Increment inventory for all SKUs of this product
-        skus = conn.execute(
-            "SELECT sku FROM skus WHERE product_id=?", (po["product_id"],)
-        ).fetchall()
-        if len(skus) == 1:
-            conn.execute(
-                "UPDATE inventory SET on_hand_qty = on_hand_qty + ? WHERE sku=?",
-                (qty_received, skus[0]["sku"])
-            )
+    # Increment inventory for all SKUs of this product
+    skus = conn.execute(
+        "SELECT sku FROM skus WHERE product_id=?", (po["product_id"],)
+    ).fetchall()
+    if len(skus) == 1:
+        conn.execute(
+            "UPDATE inventory SET on_hand_qty = on_hand_qty + ? WHERE sku=?",
+            (qty_received, skus[0]["sku"])
+        )
 
     return {
         "po_id": po["po_id"],
@@ -571,7 +624,7 @@ def receive_purchase_order(qty_received, supplier_name=None, product_name=None,
 def create_promotion(description, type, value, scope_type, scope_ref,
                      start_date, end_date):
     conn = get_conn()
-    with conn:
+    with _write_txn(conn):
         promo_id = _next_id(conn, "promotions", "PR-", "promo_id")
         conn.execute(
             "INSERT INTO promotions VALUES (?,?,?,?,?,?,?,?)",
